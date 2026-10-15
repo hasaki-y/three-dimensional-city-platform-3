@@ -1,24 +1,20 @@
 const express = require('express')
 const cors = require('cors')
+const { createV1Router } = require('./v1/routes')
 
-// 引入数据模块 + 全部分析函数（少写一个，对应接口就会 500）
-const {
-  data,
-  groupBy,
-  heightBand,
-  areaBand,
-  filterBuildings,
-  bufferAnalysis,
-  nearestPois,
-} = require('./spatial')
 const app = express()
-const PORT = 3001
+const PORT = Number(process.env.PORT || 3001)
 
 // ★坑：中间件必须先注册，再注册路由。
 //   Express 按注册顺序执行，写在路由后面的 app.use() 对前面的路由完全不生效
 //   （原代码 cors 写在最后 → 概览/聚合/筛选/分析接口全部没有 CORS 头）
 app.use(cors())
 app.use(express.json())
+const mode = process.env.DATA_MODE || 'demo'
+if (!['demo', 'postgis'].includes(mode)) throw new Error('DATA_MODE 仅支持 demo 或 postgis')
+if (mode === 'postgis' && !process.env.DATABASE_URL && !process.env.PGHOST) throw new Error('DATA_MODE=postgis 时必须设置 DATABASE_URL 或 PGHOST 等连接参数')
+const repository = mode === 'postgis' ? require('./v1/repository-postgis') : require('./v1/repository-demo')
+app.use('/api/v1', createV1Router(repository))
 
 // ===== 参数解析工具 =====
 // ★坑：原来写的是 `if (!lon || !lat)`。
@@ -38,6 +34,11 @@ function numOrNull(v) {
 }
 
 // ===== 概览接口：返回各要素数量 =====
+// Compatibility endpoints are intentionally available only in demo mode: they read in-memory GeoJSON.
+if (mode === 'demo') {
+const {
+  data, groupBy, heightBand, areaBand, filterBuildings, bufferAnalysis, nearestPois,
+} = require('./spatial')
 app.get('/api/overview', (req, res) => {
   res.json({
     buildings: data.buildings.features.length,
@@ -118,6 +119,7 @@ app.get('/api/nearest', (req, res) => {
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, time: new Date().toISOString() })
 })
+}
 
 // ===== 兜底：未匹配的 /api/* 返回 JSON 404，而不是 Express 默认的 HTML =====
 app.use('/api', (req, res) => {
@@ -134,6 +136,9 @@ app.use((err, req, res, next) => {
   console.error('[api error]', err)
   res.status(500).json({ error: err.message || '服务器内部错误' })
 })
-app.listen(PORT, () => {
-  console.log(`gis服务已启动：http://localhost:${PORT}`)
-})
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`GIS 服务已启动：http://localhost:${PORT}；数据模式：${mode}`)
+  })
+}
+module.exports = app

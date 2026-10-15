@@ -6,442 +6,575 @@
 import { ref, onMounted, onUnmounted, watch } from 'vue'
 import * as Cesium from 'cesium'
 import { SCENE_CONFIG } from '../config'
-import { useStore, type BuildingProps } from '../store'
+import { useStore } from '../store'
+import type { Building, Poi, RoadFeature, WaterFeature, EmergencyResult, ProfilePoint } from '../types'
 import { api } from '../api'
+import { createCityViewer, disposeCityViewer } from '../composables/useCesiumViewer'
+import { createSceneLayers } from '../composables/useLayerManager'
+import { pickEntityId, pickGlobePoint } from '../composables/useFeaturePick'
+import { equidistantProfileSamples } from '../composables/useDrawing'
+import { createBaseMap } from '../composables/useBaseMap'
+import { useMapStore } from '../stores/map'
+import { categoryColor } from '../config/facilities'
 
 const containerRef = ref<HTMLDivElement | null>(null)
 const store = useStore()
+const mapStore = useMapStore()
+let baseMap: ReturnType<typeof createBaseMap> | null = null
 let viewer: Cesium.Viewer | null = null
+let layers: ReturnType<typeof createSceneLayers> | null = null
+const buildingMap = new Map<string, Building>()
+const poiMap = new Map<string, Poi>()
+const resultPoiMap = new Map<string, Poi>()
+let buildingController: AbortController | null = null
+let layerController: AbortController | null = null
+let analysisController: AbortController | null = null
+let buildingRequestId = 0
+let layerRequestId = 0
 let analysisRequestId = 0
+let moveTimer: ReturnType<typeof setTimeout> | null = null
+let terrainReady = false
+let samplingTerrainProvider: Cesium.TerrainProvider | null = null
+let profileStart: Cesium.Cartographic | null = null
+let boxStart: { lon: number; lat: number } | null = null
 
-const buildingMap = new Map<string, BuildingProps>()
+const cityBounds = { west: 120.008, south: 30.264, east: 120.052, north: 30.292 }
 
-// 建筑实际外包框（loadBuildings 时累计出来）。2D 取景要用它，
-// 因为 2D 是正俯视、可见范围完全由相机高度决定，写死一个高度在不同
-// 窗口比例下会把城区切掉一半。
-let cityBounds: { west: number; south: number; east: number; north: number } | null = null
+function is2D() { return viewer?.scene.mode === Cesium.SceneMode.SCENE2D }
 
-// 当前是不是 2D 平面视角
-function is2D() {
-  return viewer?.scene.mode === Cesium.SceneMode.SCENE2D
-}
-
-// ================== 按视角切换建筑的显示方式 ==================
-// 3D：box（立方体，能看出高度差）
-// 2D：point（正俯视看不出高度，box 投影下来就是 30m 的小方块，
-//          缩放后只有几个像素、连成一片分不清，改成固定像素的圆点更清楚）
-function applyBuildingGraphics(mode: Cesium.SceneMode) {
-  if (!viewer) return
-  const flat = mode === Cesium.SceneMode.SCENE2D
-  for (const entity of viewer.entities.values) {
-    // ★只动建筑实体。分析图层的圆点（analysis-point / nearest-point-*）
-    //   也只有 point 没有 box，不拦住的话会在 3D 下被一起 show=false 关掉。
-    if (!buildingMap.has(entity.id)) continue
-    if (entity.box) entity.box.show = !flat as any
-    if (entity.point) entity.point.show = flat as any
-  }
-}
-
-// ================== 核心数据加载函数（只保留这一个，包含筛选） ==================
-async function loadBuildings() {
-  if (!viewer) return
-
-  // ★先清空旧实体，否则筛选后建筑会叠加
-  //   注意：removeAll 连分析图层（缓冲圆 / KNN 连线）一起清掉了，
-  //   所以同步把分析结果也置空，否则面板会显示"图上已经没有的结果"
-  viewer.entities.removeAll()
-  buildingMap.clear()
-  cityBounds = null
-  store.bufferResult = null
-  store.nearestResults = []
-  store.selectBuilding(null)
-
-  // 组装筛选参数（空的不传，后端默认返回全部）
-  const params: Record<string, string | number> = {}
-  if (store.filter.type) params.type = store.filter.type
-  if (store.filter.minFloors) params.minFloors = store.filter.minFloors
-
-  // ★坑：这里是 await，接口失败会抛异常。
-  //   如果不管，异常会一路冒到 onMounted —— 后面注册点击事件的代码就永远不执行，
-  //   表现为"后端没起来时，地图能拖能缩放，但点建筑完全没反应"。
-  let buildings: BuildingProps[]
-  try {
-    buildings = (await api.buildings(params)).buildings
-  } catch (e) {
-    console.error('[CityScene] 建筑数据加载失败，请确认后端 3001 已启动：', e)
-    return
-  }
-
-  const bounds = { west: Infinity, south: Infinity, east: -Infinity, north: -Infinity }
-  const flat = is2D()
-
-  buildings.forEach((b: BuildingProps) => {
-    const color = Cesium.Color.fromCssColorString(
-      SCENE_CONFIG.BUILDING_COLORS[b.type] || '#888888'
-    )
-    // ★坑：Cesium 的 BoxGeometry 以 position 为中心（corner = dimensions * 0.5）。
-    //   原来写 height:0 → 盒子中心贴在地表，一半埋在地球里被地表挡住，
-    //   楼看起来只有一半高。楼要"坐"在地上，中心必须在半高：height / 2。
-    const entity = viewer!.entities.add({
-      position: Cesium.Cartesian3.fromDegrees(b.lon, b.lat, b.height / 2),
-      // 3D 用立方体
-      box: {
-        dimensions: new Cesium.Cartesian3(30, 30, b.height),
-        material: color.withAlpha(1.0),  // 纯色不透明，更醒目
-        outline: true,
-        outlineColor: Cesium.Color.WHITE.withAlpha(0.3),
-        show: !flat,
-      },
-      // 2D 用圆点（同一个 entity 挂两份图形，切换时改 show 就行，
-      // 不用重建 3489 个实体，buildingMap 也不会失效）
-      point: {
-        pixelSize: 7,
-        color: color.withAlpha(1.0),
-        outlineColor: Cesium.Color.WHITE.withAlpha(0.3),
-        outlineWidth: 1,
-        show: flat,
-      },
-    })
-    buildingMap.set(entity.id, b)
-
-    if (b.lon < bounds.west) bounds.west = b.lon
-    if (b.lon > bounds.east) bounds.east = b.lon
-    if (b.lat < bounds.south) bounds.south = b.lat
-    if (b.lat > bounds.north) bounds.north = b.lat
-  })
-
-  // 筛选后一栋楼都没有时保持 null，flyToCity 会退回默认取景
-  cityBounds = Number.isFinite(bounds.west) ? bounds : null
-}
-
-// ================== 监听筛选条件变化（放在外层） ==================
-watch(
-  () => [store.filter.type, store.filter.minFloors],
-  async () => {
-    await loadBuildings()
-  }
-)
-
-// ================== 监听二三维切换 ==================
-watch(
-  () => store.viewMode,
-  (mode) => {
-    if (!viewer) return
-    if (mode === '2d') {
-      viewer.scene.morphTo2D(0.5)
-    } else {
-      viewer.scene.morphTo3D(0.5)
-    }
-    // morph 动画真正结束时 Cesium 会发 morphComplete，那时才摆相机（见下）。
-    // 这里先试一次，覆盖"本来就已经是目标模式、不会触发 morph"的情况。
-    flyToCity()
-  }
-)
-
-// 退出分析时清除地图标记和结果；请求未完成时使旧响应失效。
-watch(
-  () => store.analysisMode,
-  (mode) => {
-    analysisRequestId++
-    if (mode !== 'none') return
-    clearAnalysis()
-    store.bufferResult = null
-    store.nearestResults = []
-  }
-)
-
-// ================== 初始化 ==================
-onMounted(async () => {
-  viewer = new Cesium.Viewer(containerRef.value!, {
-    baseLayer: false,
-    timeline: false,
-    animation: false,
-    baseLayerPicker: false,
-    geocoder: false,
-    homeButton: false,
-    sceneModePicker: false,
-    navigationHelpButton: false,
-    fullscreenButton: false,
-    infoBox: false,
-    selectionIndicator: false,
-  })
-
-  viewer.scene.globe.baseColor = Cesium.Color.fromCssColorString('#0a1428')
-
-  // ★不加限制时相机能一路钻到地底下，画面直接穿模。
-  viewer.scene.screenSpaceCameraController.minimumZoomDistance = 60
-
-  // ★ 先注册点击事件，再去 await 拉数据。
-  viewer.screenSpaceEventHandler.setInputAction(onLeftClick, Cesium.ScreenSpaceEventType.LEFT_CLICK)
-
-  // ★★★ 补上这句否则初始地图是空的 ★★★
-  await loadBuildings()
-
-  // ★ morph 动画结束后再切建筑图形 + 把相机摆回城市中心。
-  //   必须用这个事件，不能用 setTimeout 猜时间（原因见 flyToCity 上面的注释）。
-  viewer.scene.morphComplete.addEventListener(onViewModeSettled)
-
-  // ★ 建筑加载完后，重新 setView 到城市中心（确保相机对准建筑）
-  flyToCity()
-})
-
-// ================== 视角切换收尾 ==================
-function onViewModeSettled() {
-  if (!viewer || viewer.isDestroyed()) return
-  applyBuildingGraphics(viewer.scene.mode)
-  flyToCity()
-}
-
-// 把相机摆到城市中心。
-// ★"切视角后要素全丢只剩黑屏"的真正原因（已查 Cesium 源码 + 实测确认）：
-//   1) Camera.setView 第一句就是
-//          if (this._mode === SceneMode.MORPHING) return;
-//      ——【变形动画期间调用 setView 会被静默丢弃】，不报错、不生效。
-//   2) 而且两个方向的时机还不一样，调用完 morph 立刻读 scene.mode 判断"好没好"
-//      同样不可靠：
-//        · morphTo2D() 会同步把 scene.mode 置成 MORPHING；
-//        · morphTo3D() 第一段是 camera.flyTo，同步返回时 scene.mode 仍是 SCENE2D
-//          （源码 morphFrom2DTo3D 里就写着 scene._mode = SceneMode.SCENE2D）。
-//   3) 两个方向的动画终点都是
-//          (0°, 0°) 上空 5 × 地球半径 ≈ 31890 km —— 整个地球的俯视图。
-//      本项目 baseLayer:false 没有影像，地表只有 globe.baseColor(#0a1428 近乎黑色)，
-//      所以动画一结束就是满屏黑，杭州的建筑缩到 0.2 个像素：
-//      切 2D 表现为"建筑全没了"，切回 3D 表现为"只剩一个地球"。
-//   原代码 setTimeout(600) 是在赌动画已经结束，机器一慢就赌输。
-//   现在改成：只由 morphComplete 事件触发，落地后再校验一次。
-let placeTries = 0
-
-function cameraIsOnCity() {
-  if (!viewer) return false
-  const c = viewer.camera.positionCartographic
-  const lon = Cesium.Math.toDegrees(c.longitude)
-  const lat = Cesium.Math.toDegrees(c.latitude)
-  // 动画终点是 (0°,0°) 上空 31890km，用高度/经纬度就能一眼识别出来
-  return (
-    c.height < 1e6 &&
-    Math.abs(lon - SCENE_CONFIG.center.lon) < 0.1 &&
-    Math.abs(lat - SCENE_CONFIG.center.lat) < 0.1
-  )
+function currentBbox(): string | undefined {
+  if (!viewer) return undefined
+  const rectangle = viewer.camera.computeViewRectangle(viewer.scene.globe.ellipsoid)
+  if (!rectangle) return undefined
+  const [west, south, east, north] = [rectangle.west, rectangle.south, rectangle.east, rectangle.north]
+    .map(Cesium.Math.toDegrees)
+  // This demo data is nowhere near the date line. A wrapped/global view asks the bounded API for all data.
+  if (west >= east || south >= north) return undefined
+  return [west, south, east, north].map(value => value.toFixed(6)).join(',')
 }
 
 function setCameraToCity() {
-  if (!viewer) return
-
+  if (!viewer || viewer.scene.mode === Cesium.SceneMode.MORPHING) return
   if (is2D()) {
-    // ============ 2D 平面 ============
-    // Cesium 在 2D 下不接受倾斜：setView2D 内部会把 pitch 强制成 -90°，
-    // 所以这里给的 -90° 就是"正俯视"，和 3D 的 -45° 明确区分开。
-    // 取景用 Rectangle 而不是写死高度：2D 的可见宽度 = 相机高度，
-    // 可见高度还要再乘画布宽高比，写死米数在不同窗口比例下会切掉城区；
-    // 传 Rectangle 时 Cesium 会自己算出装得下它的相机高度和中心位置
-    // （见 Camera.getRectangleCameraCoordinates → rectangleCameraPosition2D）。
-    const b = cityBounds
-    let west = SCENE_CONFIG.center.lon - SCENE_CONFIG.camera2DFallbackHalfLon
-    let east = SCENE_CONFIG.center.lon + SCENE_CONFIG.camera2DFallbackHalfLon
-    let south = SCENE_CONFIG.center.lat - SCENE_CONFIG.camera2DFallbackHalfLat
-    let north = SCENE_CONFIG.center.lat + SCENE_CONFIG.camera2DFallbackHalfLat
-    if (b) {
-      // 四周各留 8% 余量，别让最外圈的楼贴着屏幕边
-      const padLon = (b.east - b.west) * 0.08 + 0.0005
-      const padLat = (b.north - b.south) * 0.08 + 0.0005
-      west = b.west - padLon
-      east = b.east + padLon
-      south = b.south - padLat
-      north = b.north + padLat
-    }
     viewer.camera.setView({
-      destination: Cesium.Rectangle.fromDegrees(west, south, east, north),
-      orientation: {
-        heading: 0,
-        pitch: Cesium.Math.toRadians(-90),   // 正俯视
-        roll: 0,
-      },
+      destination: Cesium.Rectangle.fromDegrees(cityBounds.west, cityBounds.south, cityBounds.east, cityBounds.north),
+      orientation: { heading: 0, pitch: Cesium.Math.toRadians(-90), roll: 0 },
     })
-    return
+  } else {
+    viewer.camera.setView({
+      destination: Cesium.Cartesian3.fromDegrees(SCENE_CONFIG.center.lon, SCENE_CONFIG.center.lat, SCENE_CONFIG.camera3DHeight),
+      orientation: { heading: 0, pitch: Cesium.Math.toRadians(SCENE_CONFIG.camera3DPitch), roll: 0 },
+    })
   }
+}
 
-  // ============ 3D 三维（取景保持原样，不动）============
-  viewer.camera.setView({
-    destination: Cesium.Cartesian3.fromDegrees(
-      SCENE_CONFIG.center.lon,
-      SCENE_CONFIG.center.lat,
-      SCENE_CONFIG.camera3DHeight
-    ),
-    orientation: {
-      heading: Cesium.Math.toRadians(0),                          // 朝北
-      pitch: Cesium.Math.toRadians(SCENE_CONFIG.camera3DPitch),    // 45° 俯角
-      roll: 0,
-    },
+function applyBuildingGraphics() {
+  if (!layers) return
+  const flat = is2D()
+  for (const entity of layers.sources.buildings.entities.values) {
+    if (entity.box) entity.box.show = new Cesium.ConstantProperty(!flat)
+    if (entity.point) entity.point.show = new Cesium.ConstantProperty(flat)
+  }
+}
+
+function onMorphComplete() {
+  if (!viewer || viewer.isDestroyed()) return
+  applyBuildingGraphics()
+  // Camera.setView is ignored during MORPHING; place it only after this event.
+  setCameraToCity()
+  scheduleVisibleLoad()
+}
+
+function scheduleVisibleLoad() {
+  layers?.updateClustering()
+  if (moveTimer) clearTimeout(moveTimer)
+  moveTimer = setTimeout(() => { void loadBuildings(); void loadOtherLayers() }, 250)
+}
+
+async function loadBuildings() {
+  if (!viewer || !layers) return
+  buildingController?.abort()
+  const controller = new AbortController()
+  buildingController = controller
+  const requestId = ++buildingRequestId
+  store.loadStatus = 'loading'
+  store.loadError = ''
+  const query = {
+    bbox: currentBbox(), limit: 5000,
+    type: store.filter.type || undefined,
+    minFloors: store.filter.minFloors ?? undefined,
+  }
+  try {
+    const start = performance.now()
+    const page = await api.buildings(query, controller.signal)
+    if (controller.signal.aborted || requestId !== buildingRequestId || !layers) return
+    const source = layers.sources.buildings
+    source.entities.removeAll()
+    buildingMap.clear()
+    for (const building of page.items) {
+      buildingMap.set(building.id, building)
+      const color = Cesium.Color.fromCssColorString(SCENE_CONFIG.BUILDING_COLORS[building.type] || '#888888')
+      source.entities.add({
+        id: building.id,
+        position: Cesium.Cartesian3.fromDegrees(building.lon, building.lat, building.height / 2),
+        box: { dimensions: new Cesium.Cartesian3(30, 30, building.height), material: color,
+          outline: true, outlineColor: Cesium.Color.WHITE.withAlpha(0.3), show: !is2D() },
+        point: { pixelSize: 7, color, outlineColor: Cesium.Color.WHITE, outlineWidth: 1, show: is2D() },
+      })
+    }
+    store.loadedBuildings = page.items.length
+    store.totalBuildings = page.total
+    store.loadStatus = 'ready'
+    if (store.selected && !buildingMap.has(store.selected.id)) store.selectBuilding(null)
+    applyEmergencyHighlights()
+    console.info(`[CityScene] 建筑 BBOX 请求+解析+建实体 ${Math.round(performance.now() - start)}ms; ${page.items.length}/${page.total}`)
+  } catch (error) {
+    if (controller.signal.aborted) return
+    store.loadStatus = 'error'
+    store.loadError = error instanceof Error ? error.message : '建筑加载失败'
+  }
+}
+
+function drawPois(items: Poi[]) {
+  if (!layers) return
+  const source = layers.sources.pois
+  source.entities.removeAll()
+  poiMap.clear()
+  for (const poi of items) {
+    poiMap.set(poi.id, poi)
+    source.entities.add({
+      id: poi.id,
+      position: Cesium.Cartesian3.fromDegrees(poi.lon, poi.lat),
+      point: { pixelSize: 7,
+        color: Cesium.Color.fromCssColorString(categoryColor(poi.category)),
+        outlineColor: Cesium.Color.BLACK, outlineWidth: 1 },
+    })
+  }
+  layers.updateClustering()
+}
+
+function drawResultPois(items: Poi[]) {
+  if (!layers) return
+  layers.sources.poiResults.entities.removeAll()
+  resultPoiMap.clear()
+  for (const poi of items) {
+    const id = `result:${poi.id}`
+    if (resultPoiMap.has(id)) continue
+    resultPoiMap.set(id, poi)
+    layers.sources.poiResults.entities.add({ id, name: poi.name,
+      position: Cesium.Cartesian3.fromDegrees(poi.lon, poi.lat),
+      point: { pixelSize: 9, color: Cesium.Color.fromCssColorString(categoryColor(poi.category)),
+        outlineColor: Cesium.Color.WHITE, outlineWidth: 1, disableDepthTestDistance: Number.POSITIVE_INFINITY },
+      label: { text: poi.name, show: items.length <= 10, font: '11px sans-serif',
+        pixelOffset: new Cesium.Cartesian2(10, -12), fillColor: Cesium.Color.WHITE,
+        showBackground: true, backgroundColor: Cesium.Color.fromCssColorString('#102339').withAlpha(0.85),
+        distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0, 5000) },
+    })
+  }
+  layers.updateClustering()
+}
+
+function drawRoads(items: RoadFeature[]) {
+  if (!layers) return
+  const source = layers.sources.roads
+  source.entities.removeAll()
+  for (const feature of items) {
+    source.entities.add({
+      id: feature.properties.id,
+      polyline: { positions: Cesium.Cartesian3.fromDegreesArray(feature.geometry.coordinates.flat()),
+        width: 2, material: Cesium.Color.fromCssColorString('#e7b84d') },
+    })
+  }
+}
+
+function drawWater(items: WaterFeature[]) {
+  if (!layers) return
+  const source = layers.sources.water
+  source.entities.removeAll()
+  for (const feature of items) {
+    source.entities.add({
+      id: feature.properties.id,
+      polygon: { hierarchy: Cesium.Cartesian3.fromDegreesArray(feature.geometry.coordinates[0].flat()),
+        height: 0,
+        material: Cesium.Color.fromCssColorString('#2586bc').withAlpha(0.58),
+        outline: true, outlineColor: Cesium.Color.fromCssColorString('#6fcafa') },
+    })
+  }
+}
+
+async function loadOtherLayers() {
+  if (!viewer || !layers) return
+  layerController?.abort()
+  const controller = new AbortController()
+  layerController = controller
+  const requestId = ++layerRequestId
+  const query = { bbox: currentBbox(), limit: 5000 }
+  const results = await Promise.allSettled([
+    store.layers.pois && store.analysisMode === 'none' ? api.pois(query, controller.signal) : Promise.resolve(null),
+    store.layers.roads ? api.roads(query, controller.signal) : Promise.resolve(null),
+    store.layers.water ? api.water(query, controller.signal) : Promise.resolve(null),
+  ])
+  if (controller.signal.aborted || requestId !== layerRequestId) return
+  if (results[0].status === 'fulfilled' && results[0].value) drawPois(results[0].value.items)
+  if (results[1].status === 'fulfilled' && results[1].value) drawRoads(results[1].value.items)
+  if (results[2].status === 'fulfilled' && results[2].value) drawWater(results[2].value.items)
+  const failed = results.find(item => item.status === 'rejected')
+  if (failed?.status === 'rejected') store.loadError = failed.reason instanceof Error ? failed.reason.message : '图层加载失败'
+}
+
+function clearAnalysis() {
+  layers?.sources.poiResults.entities.removeAll()
+  resultPoiMap.clear()
+  store.selectedPoi = null
+  if (!viewer) return
+  const ids = viewer.entities.values.filter(entity => entity.id.startsWith('analysis-')).map(entity => entity.id)
+  for (const id of ids) viewer.entities.removeById(id)
+  profileStart = null
+  boxStart = null
+  applyEmergencyHighlights()
+}
+
+function cancelAnalysis() {
+  analysisRequestId++
+  analysisController?.abort()
+  analysisController = null
+  clearAnalysis()
+}
+
+function drawImpactArea(geometry: EmergencyResult['impactArea'] | NonNullable<typeof store.bufferResult>['circle']) {
+  if (!viewer || !geometry || geometry.type !== 'Polygon') return
+  viewer.entities.add({
+    id: 'analysis-area',
+    polygon: { hierarchy: Cesium.Cartesian3.fromDegreesArray(geometry.coordinates[0].flat()),
+      height: 0,
+      material: Cesium.Color.RED.withAlpha(0.24), outline: true, outlineColor: Cesium.Color.RED },
   })
 }
 
-// ★ 飞到城市中心（2D/3D 切换后由 morphComplete 事件调用）
-function flyToCity() {
-  if (!viewer || viewer.isDestroyed()) return
-
-  // 变形动画中 setView 会被静默丢弃 → 直接返回，等 morphComplete 事件再来
-  if (viewer.scene.mode === Cesium.SceneMode.MORPHING) return
-
-  setCameraToCity()
-
-  // ★落地校验：万一 setView 还是落了空（或被还在跑的动画覆盖），下一帧重摆。
-  //   校验的是"相机到底有没有到城市中心"，而不是"我以为它到了"。
-  if (!cameraIsOnCity() && placeTries++ < 300) {
-    requestAnimationFrame(flyToCity)
-  } else {
-    placeTries = 0
-  }
+function drawOrigin(lon: number, lat: number) {
+  viewer?.entities.add({ id: 'analysis-origin', position: Cesium.Cartesian3.fromDegrees(lon, lat),
+    point: { pixelSize: 12, color: Cesium.Color.YELLOW, outlineColor: Cesium.Color.BLACK, outlineWidth: 2,
+      disableDepthTestDistance: Number.POSITIVE_INFINITY } })
 }
 
-// ================== 鼠标点击处理 ==================
-async function onLeftClick(movement: Cesium.ScreenSpaceEventHandler.PositionedEvent) {
-  if (!viewer) return
-
-  // 情况 A：正在分析模式 → 点地图取经纬度，触发分析
-  if (store.analysisMode !== 'none') {
-    // ★屏幕像素坐标 → 地球经纬度（关键 API）
-    const cartesian = viewer.camera.pickEllipsoid(
-      movement.position,
-      viewer.scene.globe.ellipsoid
-    )
-    if (!cartesian) return
-    const carto = Cesium.Cartographic.fromCartesian(cartesian)
-    const lon = Cesium.Math.toDegrees(carto.longitude)
-    const lat = Cesium.Math.toDegrees(carto.latitude)
-
-    if (store.analysisMode === 'buffer') await runBuffer(lon, lat)
-    else await runNearest(lon, lat)
-    return
-  }
-
-  // 情况 B：正常模式 → 选建筑
-  const picked = viewer.scene.pick(movement.position)
-  if (picked && picked.id) {
-    const b = buildingMap.get(picked.id.id)
-    store.selectBuilding(b || null)
-  } else {
-    store.selectBuilding(null)
+function applyEmergencyHighlights() {
+  if (!layers) return
+  const result = store.emergencyResult
+  const selected = store.emergencySelectedIds ? new Set(store.emergencySelectedIds) : null
+  const affected = new Set((result?.affectedBuildings || store.bufferResult?.buildings || []).filter(item => !selected || selected.has(item.id)).map(item => item.id))
+  for (const entity of layers.sources.buildings.entities.values) {
+    const building = buildingMap.get(entity.id)
+    if (!building || !entity.box || !entity.point) continue
+    const active = affected.has(building.id) && (!store.emergencyTypeFilter || building.type === store.emergencyTypeFilter)
+    const color = active ? Cesium.Color.YELLOW : Cesium.Color.fromCssColorString(SCENE_CONFIG.BUILDING_COLORS[building.type] || '#888888')
+    entity.box.material = new Cesium.ColorMaterialProperty(color)
+    entity.point.color = new Cesium.ConstantProperty(color)
   }
 }
-// 清掉旧分析图层
-function clearAnalysis() {
-  if (!viewer) return
-  viewer.entities.removeById('analysis-point')
-  viewer.entities.removeById('analysis-circle')
-
-  // 统一清理所有 KNN 图层（线 + 终点标注）
-  const toRemove: string[] = []
-  for (const entity of viewer.entities.values) {
-    if (
-      typeof entity.id === 'string' &&
-      (entity.id.startsWith('nearest-line-') ||
-       entity.id.startsWith('nearest-point-'))
-    ) {
-      toRemove.push(entity.id)
-    }
-  }
-  toRemove.forEach((id) => viewer!.entities.removeById(id))
-}
-
 
 async function runBuffer(lon: number, lat: number) {
   if (!viewer) return
-  const requestId = ++analysisRequestId
-  clearAnalysis()
-
-  // 画中心点
-  viewer.entities.add({
-    id: 'analysis-point',
-    position: Cesium.Cartesian3.fromDegrees(lon, lat),
-    point: { pixelSize: 10, color: Cesium.Color.YELLOW },
-  })
-
-  // 调后端 /api/buffer（radius 单位 km，0.3 = 300m）
-  let result
+  resetTaskResults()
+  store.queryStatus = 'submitting'
+  store.queryError = ''
+  const id = ++analysisRequestId
+  const controller = new AbortController()
+  analysisController = controller
+  drawOrigin(lon, lat)
   try {
-    result = await api.buffer(lon, lat, 0.3)
-  } catch (e) {
-    console.error('[CityScene] 缓冲区分析失败：', e)
-    return
+    const result = await api.buffer(lon, lat, store.rangeRadiusMeters, controller.signal)
+    if (controller.signal.aborted || id !== analysisRequestId || store.analysisMode !== 'range') return
+    store.bufferResult = result
+    store.queryStatus = 'completed'
+    drawImpactArea(result.circle)
+    applyEmergencyHighlights()
+  } catch (error) {
+    if (!controller.signal.aborted) { store.queryStatus = 'error'; store.queryError = error instanceof Error ? error.message : '范围查询失败' }
   }
-  if (requestId !== analysisRequestId || store.analysisMode !== 'buffer' || !viewer || viewer.isDestroyed()) return
-  store.bufferResult = result
-
-  // 画缓冲区圆（ellipse，单位米）
-  viewer.entities.add({
-    id: 'analysis-circle',
-    position: Cesium.Cartesian3.fromDegrees(lon, lat),
-    ellipse: {
-      semiMajorAxis: result.radiusKm * 1000,
-      semiMinorAxis: result.radiusKm * 1000,
-      material: Cesium.Color.RED.withAlpha(0.2),
-      outline: true,
-      outlineColor: Cesium.Color.RED,
-    },
-  })
 }
 
-async function runNearest(lon: number, lat: number) {
+async function runFacilities(lon: number, lat: number) {
   if (!viewer) return
-  const requestId = ++analysisRequestId
-  clearAnalysis()
-
-  viewer.entities.add({
-    id: 'analysis-point',
-    position: Cesium.Cartesian3.fromDegrees(lon, lat),
-    point: { pixelSize: 10, color: Cesium.Color.YELLOW },
-  })
-
-  let result
+  resetTaskResults()
+  store.queryStatus = 'submitting'
+  store.queryError = ''
+  const id = ++analysisRequestId
+  const controller = new AbortController()
+  analysisController = controller
+  drawOrigin(lon, lat)
   try {
-    result = await api.nearest(lon, lat, '医院', 5)
-  } catch (e) {
-    console.error('[CityScene] 最近邻查询失败：', e)
-    return
+    const result = await api.facilities({ lon, lat, category: store.facilityCategory, mode: store.facilityMode,
+      limit: store.facilityLimit, radiusMeters: store.facilityRadiusMeters }, controller.signal)
+    if (controller.signal.aborted || id !== analysisRequestId || store.analysisMode !== 'facilities' || !viewer) return
+    store.facilityResult = result
+    store.queryStatus = 'completed'
+    drawResultPois(result.results)
+    if (result.area) drawImpactArea(result.area)
+  } catch (error) {
+    if (!controller.signal.aborted) { store.queryStatus = 'error'; store.queryError = error instanceof Error ? error.message : '设施查询失败' }
   }
-  if (requestId !== analysisRequestId || store.analysisMode !== 'nearest' || !viewer || viewer.isDestroyed()) return
-  store.nearestResults = result.results
-
-  result.results.forEach((r: any, i: number) => {
-    // 线：从我的位置到医院
-    viewer!.entities.add({
-      id: `nearest-line-${i}`,
-      polyline: {
-        positions: Cesium.Cartesian3.fromDegreesArray([lon, lat, r.lon, r.lat]),
-        width: 2,
-        material: Cesium.Color.CYAN,
-      },
-    })
-
-    // 医院点 + 标注：单独一个 entity，位置在医院
-    viewer!.entities.add({
-      id: `nearest-point-${i}`,
-      position: Cesium.Cartesian3.fromDegrees(r.lon, r.lat),
-      point: { pixelSize: 12, color: Cesium.Color.CYAN },
-      label: {
-        text: r.name,
-        font: '12px sans-serif',
-        fillColor: Cesium.Color.WHITE,
-        pixelOffset: new Cesium.Cartesian2(12, 0),
-      },
-    })
-  })
 }
 
-// ================== 销毁 ==================
-onUnmounted(() => {
-  if (viewer && !viewer.isDestroyed()) {
-    // ★先摘掉 morphComplete 监听：热更新会反复挂载，
-    //   直接把旧的 viewer 销毁而监听还挂在事件上，回调会拿着已销毁的 viewer 继续跑。
-    viewer.scene.morphComplete.removeEventListener(onViewModeSettled)
-    viewer.destroy()
+async function runEmergency(lon: number, lat: number) {
+  if (!viewer) return
+  resetTaskResults()
+  store.emergencyBoxSelect = false
+  store.emergencySelectedIds = null
+  store.emergencyResult = null
+  store.emergencyStatus = 'submitting'
+  store.emergencyError = ''
+  const id = ++analysisRequestId
+  const controller = new AbortController()
+  analysisController = controller
+  drawOrigin(lon, lat)
+  try {
+    const result = await api.emergency({ lon, lat, radiusMeters: store.emergencyRadiusMeters,
+      categories: [...store.emergencyCategories], eventType: store.emergencyEventType }, controller.signal)
+    if (controller.signal.aborted || id !== analysisRequestId || store.analysisMode !== 'emergency' || !viewer) return
+    store.emergencyResult = result
+    store.emergencyStatus = 'completed'
+    drawImpactArea(result.impactArea)
+    drawResultPois([...result.nearbyFacilities, ...result.nearestFacilities])
+    applyEmergencyHighlights()
+  } catch (error) {
+    if (controller.signal.aborted) return
+    store.emergencyStatus = 'error'
+    store.emergencyError = error instanceof Error ? error.message : '应急分析失败'
   }
+}
+
+function selectEmergencyBox(lon: number, lat: number) {
+  if (!viewer || !store.emergencyResult) return
+  if (!boxStart) {
+    boxStart = { lon, lat }
+    viewer.entities.removeById('analysis-box-start')
+    viewer.entities.add({ id: 'analysis-box-start', position: Cesium.Cartesian3.fromDegrees(lon, lat),
+      point: { pixelSize: 10, color: Cesium.Color.LIME } })
+    return
+  }
+  const west = Math.min(boxStart.lon, lon)
+  const east = Math.max(boxStart.lon, lon)
+  const south = Math.min(boxStart.lat, lat)
+  const north = Math.max(boxStart.lat, lat)
+  viewer.entities.removeById('analysis-box-start')
+  viewer.entities.removeById('analysis-box')
+  boxStart = null
+  if (west === east || south === north) {
+    store.emergencyError = '框选范围太小，请选择两个不同位置'
+    return
+  }
+  viewer.entities.add({ id: 'analysis-box', rectangle: {
+    coordinates: Cesium.Rectangle.fromDegrees(west, south, east, north), height: 0,
+    material: Cesium.Color.LIME.withAlpha(0.18), outline: true, outlineColor: Cesium.Color.LIME } })
+  store.emergencySelectedIds = store.emergencyResult.affectedBuildings
+    .filter(item => item.lon >= west && item.lon <= east && item.lat >= south && item.lat <= north)
+    .map(item => item.id)
+  store.emergencyBoxSelect = false
+}
+
+async function finishProfile(end: Cesium.Cartographic) {
+  if (!viewer || !profileStart || !samplingTerrainProvider || !terrainReady) return
+  const start = profileStart
+  let sampling: ReturnType<typeof equidistantProfileSamples>
+  try {
+    sampling = equidistantProfileSamples(start, end)
+  } catch (error) {
+    store.profileStatus = 'error'
+    store.profileError = error instanceof Error ? error.message : '剖面线无效'
+    profileStart = null
+    return
+  }
+  const id = ++analysisRequestId
+  store.profileStatus = 'sampling'
+  store.profileError = ''
+  const cartographics = sampling.positions
+  const count = cartographics.length
+  try {
+    const samples = await Cesium.sampleTerrainMostDetailed(samplingTerrainProvider, cartographics)
+    if (id !== analysisRequestId || store.analysisMode !== 'profile' || !viewer) return
+    const points: ProfilePoint[] = samples.map((position, index) => {
+      const lon = Cesium.Math.toDegrees(position.longitude)
+      const lat = Cesium.Math.toDegrees(position.latitude)
+      return { lon, lat, distanceMeters: sampling.totalDistanceMeters * index / (count - 1),
+        elevationMeters: Number.isFinite(position.height) ? position.height : null }
+    })
+    const heights = points.map(point => point.elevationMeters).filter((height): height is number => height !== null)
+    store.profileResult = { source: 'terrain',
+      sampleSpacingMeters: sampling.sampleSpacingMeters, totalDistanceMeters: sampling.totalDistanceMeters, points,
+      minElevationMeters: heights.length ? Math.min(...heights) : null,
+      maxElevationMeters: heights.length ? Math.max(...heights) : null }
+    store.profileStatus = 'completed'
+    viewer.entities.add({ id: 'analysis-profile-line',
+      polyline: { positions: Cesium.Cartesian3.fromDegreesArray([
+        Cesium.Math.toDegrees(start.longitude), Cesium.Math.toDegrees(start.latitude),
+        Cesium.Math.toDegrees(end.longitude), Cesium.Math.toDegrees(end.latitude)]),
+        width: 3, material: Cesium.Color.YELLOW } })
+  } catch (error) {
+    if (id !== analysisRequestId) return
+    store.profileStatus = 'error'
+    store.profileError = error instanceof Error ? error.message : '地形采样失败'
+  } finally {
+    profileStart = null
+  }
+}
+
+function onProfileClick(lon: number, lat: number) {
+  if (!viewer || !terrainReady || store.profileStatus === 'sampling') return
+  const cartographic = Cesium.Cartographic.fromDegrees(lon, lat)
+  if (!profileStart) {
+    cancelAnalysis()
+    store.profileResult = null
+    store.profileStatus = 'drawing'
+    profileStart = cartographic
+    drawOrigin(lon, lat)
+  } else {
+    void finishProfile(cartographic)
+  }
+}
+
+function onLeftClick(movement: Cesium.ScreenSpaceEventHandler.PositionedEvent) {
+  if (!viewer) return
+  if (store.analysisMode !== 'none') {
+    const point = pickGlobePoint(viewer, movement.position)
+    if (!point) return
+    const { lon, lat } = point
+    if (store.analysisMode === 'emergency' && store.emergencyBoxSelect && store.emergencyResult) {
+      selectEmergencyBox(lon, lat)
+      return
+    }
+    if (store.analysisMode === 'profile') { onProfileClick(lon, lat); return }
+    if (store.pickingAnalysisPoint) {
+      resetTaskResults()
+      store.analysisPoint = { lon, lat }
+      store.pickingAnalysisPoint = false
+      drawOrigin(lon, lat)
+      return
+    }
+  }
+  const id = pickEntityId(viewer.scene, movement.position) || ''
+  if (buildingMap.has(id)) store.selectBuilding(buildingMap.get(id)!)
+  else if (poiMap.has(id)) store.selectPoi(poiMap.get(id)!)
+  else if (resultPoiMap.has(id)) store.selectPoi(resultPoiMap.get(id)!)
+  else { store.selectBuilding(null); store.selectedPoi = null }
+}
+
+watch(() => [store.filter.type, store.filter.minFloors], () => { void loadBuildings() })
+watch(() => store.reloadToken, () => { void loadBuildings(); void loadOtherLayers() })
+watch(() => ({ ...store.layers }), () => { layers?.syncVisibility(); void loadOtherLayers() })
+watch(() => [mapStore.baseMap, mapStore.baseMapRetry], () => baseMap?.switchBaseMap(mapStore.baseMap))
+watch(() => store.viewMode, mode => {
+  if (!viewer) return
+  if (mode === '2d') viewer.scene.morphTo2D(0.5)
+  else viewer.scene.morphTo3D(0.5)
+  if (viewer.scene.mode !== Cesium.SceneMode.MORPHING) onMorphComplete()
+})
+function resetTaskResults() {
+  store.bufferResult = null
+  store.facilityResult = null
+  store.queryStatus = 'idle'
+  store.queryError = ''
+  store.emergencyResult = null
+  store.emergencyTypeFilter = ''
+  store.emergencySelectedIds = null
+  store.emergencyBoxSelect = false
+  store.emergencyStatus = store.analysisMode === 'emergency' ? 'drawing' : 'idle'
+  store.emergencyError = ''
+  store.profileResult = null
+  store.profileStatus = store.analysisMode === 'profile' ? 'drawing' : 'idle'
+  cancelAnalysis()
+}
+watch(() => store.analysisMode, mode => {
+  resetTaskResults()
+  store.analysisPoint = null
+  store.pickingAnalysisPoint = mode !== 'none' && mode !== 'profile'
+  layers?.syncVisibility()
+  void loadOtherLayers()
+})
+// Changing parameters invalidates results and pending work before another submit.
+watch(() => [store.facilityCategory, store.facilityMode, store.facilityLimit, store.facilityRadiusMeters,
+  store.rangeRadiusMeters, store.emergencyEventType, store.emergencyRadiusMeters, ...store.emergencyCategories], () => {
+  resetTaskResults()
+  if (store.analysisPoint) drawOrigin(store.analysisPoint.lon, store.analysisPoint.lat)
+}, { flush: 'sync' })
+watch(() => store.analysisSubmitToken, () => {
+  const point = store.analysisPoint
+  if (!point) return
+  if (store.analysisMode === 'facilities') void runFacilities(point.lon, point.lat)
+  if (store.analysisMode === 'range') void runBuffer(point.lon, point.lat)
+  if (store.analysisMode === 'emergency') void runEmergency(point.lon, point.lat)
+})
+watch(() => store.emergencyTypeFilter, applyEmergencyHighlights)
+watch(() => store.emergencySelectedIds, ids => {
+  if (ids === null) viewer?.entities.removeById('analysis-box')
+  applyEmergencyHighlights()
+})
+watch(() => store.emergencyBoxSelect, enabled => {
+  if (!enabled && boxStart) {
+    boxStart = null
+    viewer?.entities.removeById('analysis-box-start')
+  }
+})
+watch(() => store.focusBuildingId, id => {
+  const building = buildingMap.get(id) || store.emergencyResult?.affectedBuildings.find(item => item.id === id)
+  if (building && viewer) viewer.camera.flyTo({ destination: Cesium.Cartesian3.fromDegrees(building.lon, building.lat, 600) })
+})
+watch(() => store.profileFocusIndex, index => {
+  if (!viewer || index < 0) return
+  const point = store.profileResult?.points[index]
+  if (!point) return
+  viewer.entities.removeById('analysis-profile-focus')
+  viewer.entities.add({ id: 'analysis-profile-focus', position: Cesium.Cartesian3.fromDegrees(point.lon, point.lat),
+    point: { pixelSize: 13, color: Cesium.Color.LIME, outlineColor: Cesium.Color.BLACK, outlineWidth: 2 } })
+})
+
+onMounted(async () => {
+  viewer = createCityViewer(containerRef.value!)
+  baseMap = createBaseMap(viewer, message => { mapStore.baseMapError = message })
+  baseMap.switchBaseMap(mapStore.baseMap)
+  layers = createSceneLayers(viewer, store)
+  viewer.screenSpaceEventHandler.setInputAction(onLeftClick, Cesium.ScreenSpaceEventType.LEFT_CLICK)
+  viewer.scene.morphComplete.addEventListener(onMorphComplete)
+  setCameraToCity()
+  viewer.camera.moveEnd.addEventListener(scheduleVisibleLoad)
+  void api.health().then(health => { store.sourceMode = health.mode }).catch(() => {})
+  await Promise.all([loadBuildings(), loadOtherLayers()])
+  const token = import.meta.env.VITE_CESIUM_ION_TOKEN
+  if (token && viewer && !viewer.isDestroyed()) {
+    store.terrainStatus = 'loading'
+    Cesium.Ion.defaultAccessToken = token
+    try {
+      const provider = await Cesium.createWorldTerrainAsync()
+      if (!viewer || viewer.isDestroyed()) return
+      // Keep the demo globe at ellipsoid height so its synthetic building boxes remain visible.
+      // This provider is used only to sample the profile line.
+      samplingTerrainProvider = provider
+      terrainReady = true
+      store.terrainStatus = 'ready'
+    } catch (error) {
+      store.terrainStatus = 'error'
+      console.warn('[CityScene] 地形服务不可用，剖面已禁用', error)
+    }
+  }
+})
+
+onUnmounted(() => {
+  buildingController?.abort()
+  layerController?.abort()
+  analysisController?.abort()
+  if (moveTimer) clearTimeout(moveTimer)
+  if (viewer && !viewer.isDestroyed()) {
+    baseMap?.dispose()
+    viewer.scene.morphComplete.removeEventListener(onMorphComplete)
+    viewer.camera.moveEnd.removeEventListener(scheduleVisibleLoad)
+    disposeCityViewer(viewer)
+  }
+  viewer = null
+  layers = null
+  samplingTerrainProvider = null
+  terrainReady = false
 })
 </script>
 
 <style scoped>
-.city-scene {
-  position: absolute;
-  inset: 0;
-}
+.city-scene { position: absolute; inset: 0; }
 </style>

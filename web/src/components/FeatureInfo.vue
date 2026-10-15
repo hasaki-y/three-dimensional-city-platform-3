@@ -16,7 +16,14 @@
       </div>
     </div>
 
-    <p v-else class="hint">点击场景中的建筑查看属性</p>
+    <div v-else-if="store.selectedPoi" class="info">
+      <div class="row"><span class="label">名称</span><span>{{ store.selectedPoi.name }}</span></div>
+      <div class="row"><span class="label">类型</span><span>{{ store.selectedPoi.type }}</span></div>
+      <div class="row"><span class="label">片区</span><span>{{ store.selectedPoi.district }}</span></div>
+      <div class="row"><span class="label">编号</span><span>{{ store.selectedPoi.id }}</span></div>
+    </div>
+
+    <p v-else class="hint">点击场景中的建筑或 POI 查看属性</p>
   </div>
 </template>
 
@@ -37,4 +44,5 @@ h3 { margin: 0 0 12px; font-size: 14px; color: #5b8ff9; }
 }
 .label { color: #7a8ba8; }
 .hint { color: #7a8ba8; font-size: 13px; }
+.analysis-summary { margin-top: 12px; color: #f6bd16; font-size: 12px; line-height: 1.5; }
 </style>

@@ -28,3 +28,7 @@ Thumbs.db
 Desktop.ini
 .vscode/
 .idea/
+**/*.timestamp-*.mjs
+
+# Project-local PostgreSQL cluster, logs and generated credentials
+.local/

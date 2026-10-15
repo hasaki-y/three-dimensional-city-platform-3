@@ -39,8 +39,12 @@ function cesiumAssets(): Plugin {
         '.wasm': 'application/wasm',
       }
       server.middlewares.use('/cesium', (req, res, next) => {
-        const file = path.resolve(CESIUM_DIR, decodeURIComponent(req.url!.replace(/^\//, '')))
-        if (fs.existsSync(file) && fs.statSync(file).isFile()) {
+        let relative: string
+        try { relative = decodeURIComponent((req.url || '').replace(/^\//, '')) }
+        catch { next(); return }
+        const base = path.resolve(CESIUM_DIR)
+        const file = path.resolve(base, relative)
+        if (file.startsWith(base + path.sep) && fs.existsSync(file) && fs.statSync(file).isFile()) {
           const ext = path.extname(file).toLowerCase()
           res.setHeader('Content-Type', mime[ext] || 'application/octet-stream')
           fs.createReadStream(file).pipe(res)
@@ -59,11 +63,11 @@ export default defineConfig({
   base: './',                 // 用相对路径，部署到服务器任意子目录都能跑
   plugins: [vue(), cesiumAssets()],
   server: {
-    port: 5173,
+    port: Number(process.env.WEB_PORT || 5173),
     proxy: {
       // 开发时：前端请求 /api/xxx 自动转发到后端 3001
       // 浏览器只认 5173，代理在后端视角里"假装"是 5173 发出的
-      '/api': 'http://localhost:3001',
+      '/api': process.env.API_PROXY_TARGET || 'http://localhost:3001',
     },
   },
 })

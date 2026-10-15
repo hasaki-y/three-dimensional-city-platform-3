@@ -1,0 +1,49 @@
+services:
+  db:
+    image: postgis/postgis:16-3.5
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-city}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_this_local_demo_password}
+      POSTGRES_DB: ${POSTGRES_DB:-city_demo}
+    ports:
+      - '127.0.0.1:5432:5432'
+    volumes:
+      - city_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-city} -d ${POSTGRES_DB:-city_demo}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  server:
+    build: ./server
+    environment:
+      DATA_MODE: postgis
+      PGHOST: db
+      PGPORT: 5432
+      PGUSER: ${POSTGRES_USER:-city}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-change_this_local_demo_password}
+      PGDATABASE: ${POSTGRES_DB:-city_demo}
+      PORT: 3001
+    ports:
+      - '127.0.0.1:3001:3001'
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build: ./web
+    environment:
+      API_PROXY_TARGET: http://server:3001
+      VITE_CESIUM_ION_TOKEN: ${VITE_CESIUM_ION_TOKEN:-}
+      VITE_BASEMAP_DARK_URL: ${VITE_BASEMAP_DARK_URL:-}
+      VITE_BASEMAP_LIGHT_URL: ${VITE_BASEMAP_LIGHT_URL:-}
+      VITE_BASEMAP_IMAGERY_URL: ${VITE_BASEMAP_IMAGERY_URL:-}
+      VITE_BASEMAP_CREDIT: ${VITE_BASEMAP_CREDIT:-}
+    ports:
+      - '127.0.0.1:5173:5173'
+    depends_on:
+      - server
+
+volumes:
+  city_pgdata:

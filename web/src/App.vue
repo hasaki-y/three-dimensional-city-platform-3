@@ -1,8 +1,9 @@
 <template>
   <div class="app">
     <header class="topbar">
-      <h1>三维城市数字孪生平台</h1>
-      <span class="subtitle">杭州未来科技城 · WebGIS 空间分析演示</span>
+      <h1>三维城市空间分析平台 3.0</h1>
+      <span class="subtitle">城市浏览 · 设施查询 · 应急分析</span>
+      <button class="panel-toggle" @click="showResults = !showResults">{{ showResults ? '收起结果' : '查看结果' }}</button>
     </header>
 
     <div class="main">
@@ -13,12 +14,15 @@
 
       <div class="scene-wrap">
         <CityScene />
-        <ParticleLayer />
+        <BaseMapControl />
       </div>
 
 
-      <aside class="panel right">
-        <StatisticsPanel />
+      <aside v-show="showResults" class="panel right">
+        <StatisticsPanel v-if="showResults && store.analysisMode === 'none'" />
+        <QueryResultPanel />
+        <EmergencyPanel />
+        <ProfilePanel />
         <FeatureInfo />
       </aside>
 
@@ -27,11 +31,21 @@
 </template>
 
 <script setup lang="ts">
-import ParticleLayer from './components/ParticleLayer.vue'
+import { ref, watch } from 'vue'
+import { useStore } from './store'
+import BaseMapControl from './components/BaseMapControl.vue'
+import QueryResultPanel from './components/QueryResultPanel.vue'
 import StatisticsPanel from './components/StatisticsPanel.vue'
 import ControlPanel from './components/ControlPanel.vue'
 import CityScene from './components/CityScene.vue'
 import FeatureInfo from './components/FeatureInfo.vue'
+import EmergencyPanel from './components/EmergencyPanel.vue'
+import ProfilePanel from './components/ProfilePanel.vue'
+const store = useStore()
+const showResults = ref(window.innerWidth >= 1000)
+watch(() => [store.queryStatus, store.emergencyStatus, store.selected, store.selectedPoi], () => {
+  if (store.queryStatus === 'completed' || store.queryStatus === 'error' || store.emergencyStatus === 'completed' || store.emergencyStatus === 'error' || store.selected || store.selectedPoi) showResults.value = true
+})
 </script>
 
 <style>
@@ -66,6 +80,7 @@ import FeatureInfo from './components/FeatureInfo.vue'
 /* ⭐ min-height: 0 必须！flex 子项默认 min-height:auto，
    会让下面的 panel 撑破屏幕、overflow-y:auto 失效 */
 .main {
+  position: relative;
   flex: 1;
   display: flex;
   min-height: 0;
@@ -87,7 +102,15 @@ import FeatureInfo from './components/FeatureInfo.vue'
 .scene-wrap {
   flex: 1;
   position: relative;
-  min-width: 300px;
+  min-width: 0;
   overflow: hidden;
+}
+.panel-toggle { margin-left: auto; align-self: center; border: 1px solid #395269; background: #21374b; color: #cbd9e6; padding: 6px 10px; border-radius: 5px; cursor: pointer; white-space: nowrap; }
+@media (max-width: 1100px) {
+  .panel.right { position: absolute; z-index: 3; right: 8px; top: 56px; bottom: 12px; width: min(280px, 42vw); border: 1px solid #395269; border-radius: 8px; }
+  .subtitle { display: none; }
+  .topbar { align-items: center; padding: 0 12px; }
+  .topbar h1 { font-size: 15px; }
+  .panel.left { width: 190px; padding: 12px; }
 }
 </style>

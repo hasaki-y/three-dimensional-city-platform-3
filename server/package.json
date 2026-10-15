@@ -5,7 +5,9 @@
   "description": "后端服务：GIS 空间分析接口",
   "main": "src/index.js",
   "scripts": {
-    "dev": "node src/index.js"
+    "dev": "node src/index.js",
+    "db:import": "node scripts/import-postgis.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "@turf/buffer": "^7.2.0",
@@ -13,6 +15,7 @@
     "@turf/nearest-point": "^7.2.0",
     "@turf/points-within-polygon": "^7.2.0",
     "cors": "^2.8.5",
-    "express": "^4.21.0"
+    "express": "^4.21.0",
+    "pg": "^8.23.1"
   }
 }
